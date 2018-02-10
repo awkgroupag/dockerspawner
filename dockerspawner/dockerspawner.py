@@ -11,18 +11,21 @@ import warnings
 import docker
 from docker.errors import APIError
 from docker.utils import kwargs_from_env
-from tornado import gen
+from tornado import gen, web
 
 from escapism import escape
 from jupyterhub.spawner import Spawner
 from traitlets import (
-    Dict,
-    Unicode,
-    Bool,
-    Int,
     Any,
+    Bool,
+    Dict,
+    List,
+    Int,
+    Unicode,
+    Union,
     default,
     observe,
+    validate,
 )
 
 from .volumenamingstrategy import default_format_volume_name
@@ -141,6 +144,57 @@ class DockerSpawner(Spawner):
         as long as the version of jupyterhub in the image is compatible.
         """
     )
+
+    image_whitelist = Union([Dict(), List()],
+        config=True,
+        help="""
+        List or dict of images that users can run.
+
+        If specified, users will be presented with a form
+        from which they can select an image to run.
+        """
+    )
+
+    @validate('image_whitelist')
+    def _image_whitelist_dict(self, proposal):
+        """cast image_whitelist to a dict
+
+        If passing a list, cast it to a {item:item}
+        dict where the keys and values are the same.
+        """
+        whitelist = proposal.value
+        if not isinstance(whitelist, dict):
+            whitelist = {item:item for item in whitelist}
+        return whitelist
+
+    @default('options_form')
+    def _default_options_form(self):
+        if len(self.image_whitelist) <= 1:
+            # default form only when there are images to choose from
+            return ''
+        # form derived from wrapspawner.ProfileSpawner
+        option_t = '<option value="{image}" {selected}>{image}</option>'
+        options = [
+            option_t.format(
+                image=image,
+                selected='selected' if image == self.image else ''
+            )
+            for image in self.image_whitelist
+        ]
+        return """
+        <label for="image">Select an image:</label>
+        <select class="form-control" name="image" required autofocus>
+        {options}
+        </select>
+        """.format(options=options)
+
+    def options_from_form(self, formdata):
+        """Turn options formdata into user_options"""
+        options = {}
+        print(formdata)
+        if 'image' in formdata:
+            options['image'] = formdata['image'][0]
+        return options
 
     container_prefix = Unicode(
         "jupyter",
@@ -476,6 +530,25 @@ class DockerSpawner(Spawner):
         `extra_host_config` take precedence over their global counterparts.
 
         """
+        # image priority:
+        # 1. explicit argument
+        #    (this never happens when DockerSpawner is used directly,
+        #    but can be used by subclasses)
+        # 2. user options (from spawn options form)
+        # 3. self.image from config
+        image = image or self.user_options.get('image') or self.image
+        if self.image_whitelist:
+            if image not in self.image_whitelist:
+                raise web.HTTPError(400,
+                    "Image %s not in whitelist: %s" % (
+                        image, ', '.join(self.image_whitelist)
+                    )
+                )
+            # resolve image alias to actual image name
+            image = self.image_whitelist[image]
+        # save choice in self.image
+        self.image = image
+
         container = yield self.get_container()
         if container and self.remove_containers:
             self.log.warning(
@@ -486,7 +559,6 @@ class DockerSpawner(Spawner):
             container = None
 
         if container is None:
-            image = image or self.image
             if self._user_set_cmd:
                 cmd = self.cmd
             else:
